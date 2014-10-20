@@ -39,41 +39,77 @@ _PAPERKEY_FMT_VERSION_OCTET = b"\x00" # paperkey format version length
 _FINGERPRINT_OCTET_CNT = 20   # the current version of OpenPGP uses 20 octets
 _SECRET_LEN_OCTET_CNT = 2     # length preceding each key printed by paperkey
 _SECRET_LEN_PACK_FMT = ">H"   # format passed to pack struct.(un)pack
-_CRC_OCTET_CNT_ = 3           # trailing checksum length produced by paperkey
-_CRC_FAKED_OCTETS = b"\x00" * _CRC_OCTET_CNT_ # a fake CRC24
+_CRC_OCTET_CNT = 3           # trailing checksum length produced by paperkey
+_CRC_FAKED_OCTETS = b"\x00" * _CRC_OCTET_CNT # a fake CRC24
 
-# Secret (sub)keys begin with the prefix FE0?030? (empirically verified)
-# _SECRET_MAGIC_PREFIX_MASK = b"\xFF\xF0\xFF\xF0"
-# _SECRET_MAGIC_PREFIX =      b"\xFE\x00\x03\x00"
 _SECRET_COMMON_PREFIX_OCTET_CNT = 13  # likely shared with 1st subkey (E)
 _SECRET_PLAINTEXT_TAG = b"\x00"
 _SECRET_PLAINTEXT_CHKSUM_OCTET_CNT = 2
 _SECRET_PLAINTEXT_CHKSUM_PACK_FMT = ">H" # format passed to pack struct.(un)pack
+_SECRET_S2K_TAGS = (b"\xFE", b"\xFF")
+_SECRET_S2K_MODE_ITER_SALTED_OCTET = b"\x03"
+_SECRET_S2K_SALT_IND = 4 # index at which the non-stripped S2K salt begins
+_SECRET_S2K_SALT_OCTET_CNT = 8
+
+def _reversed_dict(d):
+    return dict((v, k) for k, v in d.items())
+
+class S2KCountCodec(object):
+    @property
+    def _expbias(self): return 6
+    @property
+    def _shift(self): return 4
+    @property
+    def _mask(self): return (1 << self._shift) - 1
+
+    def decode(self, octet):
+        c = ord(octet)
+        return (1 + self._mask + (c & self._mask)) << (
+            (c >> self._shift) + self._expbias)
+
+    @classmethod
+    def _to_bytes(cls, ordinal):
+        return bytes(bytearray([ordinal]))
+
+    def encode(self, count):
+        # TODO: reduce time complexity to O(1) by reverse-engineering decode()
+        lo, hi = 0x00, 0xFF
+        while lo < hi:          # round up octet using binary search
+            mid = (lo + hi - 1) // 2
+            mid_count = self.decode(self._to_bytes(mid))
+            if mid_count >= count:
+                hi = mid
+            else:
+                lo = mid + 1
+        return self._to_bytes(hi)
 
 S2K_CIPHER_ALGOS = {
+    # 'IDEA': b"\x01", # discouraged as it is broken
+    # '3DES': b"\x02", # discouraged as it is broken
     'CAST5': b"\x03",
-    'BLOWFISH': b"\x04",
+    # 'BLOWFISH': b"\x04", # discouraged as there is a class of known weak keys
     'AES128': b"\x07",
     'AES192': b"\x08",
     'AES256': b"\x09",
     'TWOFISH': b"\x0A",
 }
+S2K_CIPHER_OCTETS = _reversed_dict(S2K_CIPHER_ALGOS)
 S2K_DIGEST_ALGOS = {
+    # 'MD5': b"\x01", # deprecated
     'SHA1': b"\x02",
+    'RIPEMD160': b"\x03",
     'SHA256': b"\x08",
     'SHA384': b"\x09",
     'SHA512': b"\x0A",
     'SHA224': b"\x0B",
 }
+S2K_DIGEST_OCTETS = _reversed_dict(S2K_DIGEST_ALGOS)
 S2K = namedtuple('S2K', ['cipher_algo', 'digest_algo', 'count'])
-S2K_DEFAULTS = S2K("CAST5", "SHA1", 65536)
-
-def create_s2k(
-        cipher_algo=S2K_DEFAULTS.cipher_algo,
-        digest_algo=S2K_DEFAULTS.digest_algo,
-        count=S2K_DEFAULTS.count,
-):
-    return S2K(cipher_algo, digest_algo, count)
+S2K_DEFAULTS = S2K(
+    S2K_CIPHER_ALGOS['CAST5'],
+    S2K_DIGEST_ALGOS['SHA1'],
+    S2KCountCodec().encode(65536),
+)
 
 class ForwardCompatError(Exception):
     def __init__(self, msg_suffix):
@@ -95,10 +131,16 @@ def _info(*objs):
 def _warn(*objs):
     _info("warning:", *objs)
 
-def _create_recovery_reminder(option, arg):
-    def to_option_args(arg): # converts to "[option arg...]" if iterable
-        try: return " ".join("%s %s" % (option, arg) for arg in arg)
-        except TypeError: return to_option_args((arg,))
+def _create_recovery_reminder(option, arg=None):
+    def to_option_args(arg):
+        if arg is None:
+            return option
+        try: # converts to "[option arg...]" if iterable but not string
+            if not isinstance(arg, str):
+                return " ".join("%s %s" % (option, arg) for arg in arg)
+        except TypeError:
+            pass
+        return to_option_args((arg,))
 
     return '\n (REMEMBER to pass "%s" in the recovery)' % to_option_args(arg)
 
@@ -115,7 +157,7 @@ def minify(octets):
     fingerprints = []
     secrets = []
     ind = 1
-    ind_to = len(octets) - _CRC_OCTET_CNT_
+    ind_to = len(octets) - _CRC_OCTET_CNT
     while ind < ind_to:
         if octets[ind] != _PGP_VERSION_OCTET:
             raise ForwardCompatError(
@@ -156,6 +198,9 @@ def minify(octets):
 
         secrets.append(secret)
 
+    if not secrets:
+        raise ValueError("Invalid secret key data.")
+
     secret_lens = map(len, secrets)
     if len(set(secret_lens)) != 1:
         len_diffs = [sub_len - secret_lens[0] for sub_len in secret_lens[1:]]
@@ -163,63 +208,192 @@ def minify(octets):
             "(Sub)key lengths not unique; |subkey| - |key| = %s" % len_diffs +
             _create_recovery_reminder("--length-diff", len_diffs)
         )
+    del secret_lens
 
-    secret_prefix = bytes(commonprefix(secrets) if len(secrets) else "")
+    scp = bytes(commonprefix(secrets))
     if verbosity > 0:
-        _info("Secret common prefix:", _uppercase_hexlify(secret_prefix))
+        _info("Secret common prefix:", _uppercase_hexlify(scp))
 
     if len(secrets) > 2:
         raise NotImplementedError(
             "Multiple subkeys not supported (found %d)" % (len(secrets) - 1),
         )
 
-    if len(secret_prefix) < _SECRET_COMMON_PREFIX_OCTET_CNT:
+    if len(scp) < _SECRET_COMMON_PREFIX_OCTET_CNT:
         _warn(
             "sub(key)s do not share a common prefix of length %d" % (
                 _SECRET_COMMON_PREFIX_OCTET_CNT,
-            ) + _create_recovery_reminder("--prefix-length", len(secret_prefix))
+            ) + _create_recovery_reminder("--prefix-length", len(scp))
         )
 
         # Warn if any redundancy found outside secret common prefix
         matching_octet_cnt = sum(b1 ^ b2 == 0 for b1, b2 in zip(*map(
             lambda s: s[:_SECRET_COMMON_PREFIX_OCTET_CNT],
             map(bytearray, secrets),
-        ))) - len(secret_prefix)
+        ))) - len(scp)
         if matching_octet_cnt:
             _warn("%d octets match after secret common prefix %s" % (
                     matching_octet_cnt,
-                    _uppercase_hexlify(secret_prefix)
+                    _uppercase_hexlify(scp)
             ))
 
-    out = secret_prefix
-    for secret in secrets:
-        out += bytes(secret[len(secret_prefix):])
-    return out, fingerprints
+    def strip_s2k_part(secret):
+        scp_strip_cnt, secret_len0 = 0, len(secret)
+        cipher_algo, mode, digest_algo, count = None, None, None, None
+        ret = lambda: (
+            secret,
+            scp_strip_cnt,
+            S2K(cipher_algo, digest_algo, count) if digest_algo else None,
+        )
+        if not any(secret.startswith(tag) for tag in _SECRET_S2K_TAGS):
+            return ret()
 
-def unminify(octets, fingerprints, s2k, len_diffs, common_prefix_len):
+        first_octet, secret = secret[0], secret[1:]
+        try: # avoid multiple "if len(secret)" by catching IndexError
+            cipher_algo, secret = secret[0], secret[1:]
+
+            mode, secret = secret[0], secret[1:]
+            if mode != _SECRET_S2K_MODE_ITER_SALTED_OCTET:
+                raise NotImplementedError("only --s2k-mode 3 keys supported")
+
+            digest_algo, secret = secret[0], secret[1:]
+
+            # force raising IndexError if prefix too short
+            count, secret = (
+                secret[_SECRET_S2K_SALT_OCTET_CNT],
+                secret[: _SECRET_S2K_SALT_OCTET_CNT] +
+                secret[_SECRET_S2K_SALT_OCTET_CNT + 1 :],
+            )
+        except IndexError:
+            raise ValueError("Invalid secret key - incomplete S2K part")
+        finally:
+            scp_strip_cnt = min(secret_len0 - len(secret), len(scp))
+            if _SECRET_S2K_SALT_IND < scp_strip_cnt and (
+                len(scp) <= _SECRET_S2K_SALT_IND + _SECRET_S2K_SALT_OCTET_CNT
+            ): # handle the case when common prefix does not contain S2K count
+                scp_strip_cnt -= 1
+
+            return ret()
+
+    # Strip S2K only from the subkey only (or key if no subkeys),
+    # and strip common prefix from the remaining (sub)keys
+    # Note that the opposite wouldn't work in case of --export-secret-subkeys,
+    # since the first subkey would have a different, non-standard, S2K part
+    # and S2K part of the 2nd would not be fully contained in the common prefix:
+    # __ __               <- secret common prefix of length <= 2
+    # F? ?? 6? ?? ??      <- s2k mode octet (#3) is 0x64-0x6E (experimental)
+    # F? ?? 0? ?? ?? ...  <- s2k mode octet (#3) is 0x00, 0x01 or 0x03
+    secrets[-1], scp_strip_cnt, s2k = strip_s2k_part(secrets[-1])
+    secrets[-1] = secrets[-1][len(scp) - scp_strip_cnt :]
+    secrets[:-1] = map(lambda s: s[len(scp):], secrets[:-1])
+    scp = strip_s2k_part(scp)[0] # strip S2K part from the common prefix
+
+    # Remind for non-default S2K options
+    if not scp_strip_cnt:
+        _warn("key not encrypted" + _create_recovery_reminder("--plaintext"))
+    else:
+        crr = _create_recovery_reminder # reduce verbosity by aliasing
+        if s2k.digest_algo != S2K_DEFAULTS.digest_algo:
+            _warn(
+                "did not use the %s secret-to-key digest algorithm" % (
+                    S2K_DIGEST_OCTETS[S2K_DEFAULTS.digest_algo]
+                ) + crr("--s2k-digest-algo", S2K_DIGEST_OCTETS[s2k.digest_algo])
+            )
+        if s2k.cipher_algo != S2K_DEFAULTS.cipher_algo:
+            _warn(
+                "did not use the %s secret-to-key cipher algorithm" % (
+                    S2K_CIPHER_OCTETS[S2K_DEFAULTS.cipher_algo]
+                ) + crr("--s2k-cipher-algo", S2K_CIPHER_OCTETS[s2k.cipher_algo])
+            )
+        if s2k.count != S2K_DEFAULTS.count:
+            count_codec = S2KCountCodec()
+            _warn(
+                "passphrase was not mangled %d times" % (
+                    count_codec.decode(S2K_DEFAULTS.count)
+                ) + crr("--s2k-count", count_codec.decode(s2k.count))
+            )
+        del crr
+
+    out = scp
+    for secret in secrets:
+        out += secret
+    return out, fingerprints, s2k
+
+def unminify(octets, fingerprints, s2k, len_diffs, implicit_scp_len):
     if len(len_diffs) != len(fingerprints):
         raise ValueError("length diffs inconsistent with found fingerprints")
+    if not fingerprints:
+        raise ValueError("no (sub)key to unminify")
 
-    count = len(len_diffs)    # (sub)keys to recover
-    if count > 2:
+    subkey_cnt = len(len_diffs)      # number of (sub)keys
+    if subkey_cnt > 2:
         raise NotImplementedError(
-            "Multiple subkeys not supported (requested %d)" % count
+            "Multiple subkeys not supported (requested %d)" % subkey_cnt
         )
 
-    secret_prefix = octets[:common_prefix_len]
-    secret_suffix_sum = len(octets) - common_prefix_len
-    secret_len_avg = (secret_suffix_sum - sum(len_diffs)) / count
-    if (common_prefix_len + sum(len_diffs) + secret_len_avg * count !=
+    scp_len = implicit_scp_len
+    if s2k:
+        # scp_len = max(scp_len - _SECRET_S2K_SALT_IND - (
+        #     scp_len > _SECRET_S2K_SALT_IND + _SECRET_S2K_SALT_OCTET_CNT), 0)
+        # s2k_outside_scp_cnt = max(_SECRET_S2K_SALT_OCTET_CNT - scp_len, 0)
+        if scp_len < _SECRET_S2K_SALT_IND + _SECRET_S2K_SALT_OCTET_CNT:
+            scp_len = max(scp_len - _SECRET_S2K_SALT_IND, 0)
+            s2k_outside_scp_cnt = _SECRET_S2K_SALT_OCTET_CNT - scp_len
+        else:
+            scp_len -= _SECRET_S2K_SALT_IND
+            if scp_len > _SECRET_S2K_SALT_OCTET_CNT: # if S2K count not in scp
+                scp_len -= 1
+            s2k_outside_scp_cnt = 0
+        if verbosity > 1:
+            _info("%d octets of S2K salt outside secret common prefix" % (
+                s2k_outside_scp_cnt
+            ))
+
+    secret_suffix_sum = len(octets) - scp_len
+    secret_len_avg = (secret_suffix_sum - sum(len_diffs)) / subkey_cnt
+    if (scp_len + sum(len_diffs) + secret_len_avg * subkey_cnt !=
         len(octets)) or secret_suffix_sum < 0:
         raise ValueError("length diffs inconsistent with common prefix length")
+    del secret_suffix_sum
 
-    ind = common_prefix_len
+    # Strip off (part of) S2K salt from the last subkey (if present)
+    if s2k:
+        s2k_salt = octets[: min(scp_len, _SECRET_S2K_SALT_OCTET_CNT)]
+        if s2k_outside_scp_cnt:
+            last_secret_ind = secret_len_avg + len_diffs[-1]
+            s2k_salt += octets[
+                -last_secret_ind : -last_secret_ind + s2k_outside_scp_cnt
+            ]
+            octets = (
+                octets[:-last_secret_ind] +
+                octets[-last_secret_ind + s2k_outside_scp_cnt :]
+            )
+        if verbosity > 0:
+            _info("S2K salt: ", _uppercase_hexlify(s2k_salt))
+
+    s2k_part_len_max = 4 + _SECRET_S2K_SALT_OCTET_CNT + 1
+    last_prefix = octets[:implicit_scp_len] if s2k is None else (
+        _SECRET_S2K_TAGS[0] + s2k.cipher_algo +
+        _SECRET_S2K_MODE_ITER_SALTED_OCTET + s2k.digest_algo +
+        s2k_salt + s2k.count
+    )
+    secret_prefixes = [
+        last_prefix[:implicit_scp_len] for i in range(subkey_cnt - 1)
+    ] + [last_prefix]
+
+    if verbosity > 2:
+        _info("Explicit Common Prefix length:", scp_len)
+        _info("Prefixes:", map(_uppercase_hexlify, secret_prefixes))
+
+    ind = scp_len
     out = bytearray(_PAPERKEY_FMT_VERSION_OCTET)
-    for fingerprint, len_diff in zip(fingerprints, len_diffs):
+    for len_diff, fp, secret_prefix in zip(
+            len_diffs, fingerprints, secret_prefixes
+    ):
         out += _PGP_VERSION_OCTET
-        out += fingerprint
+        out += fp
         if verbosity > 1:
-            _info("Fingerprint:", _uppercase_hexlify(fingerprint))
+            _info("Fingerprint:", _uppercase_hexlify(fp))
 
         secret_suffix_len = secret_len_avg + len_diff
         secret = secret_prefix + octets[ind : ind + secret_suffix_len]
@@ -245,7 +419,7 @@ def unminify(octets, fingerprints, s2k, len_diffs, common_prefix_len):
 
 def _parse_fingerprints(pgp_out):
     return [
-        # TODO: is there a more machine-readable way to retrieve fingerprints?
+        # TODO: is there a more machine-friendly way to retrieve fingerprints?
         "".join(line.partition("=")[-1].split())
         for line in pgp_out.split("\n")
         if "fingerprint" in line and not line.startswith("uid")
@@ -304,88 +478,96 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "key", nargs='?',
-        help="The secret key to (un)minify (will be passed to gpg)",
+        help="the secret key to (un)minify (will be passed to gpg)",
     )
     parser.add_argument(
         "-v", "--verbose", dest='verbosity',
-        help="Increase output verbosity (can be repeated)",
+        help="increase output verbosity (can be repeated)",
         action='count', default=0,
     )
     parser.add_argument(
         "-q", "--quiet", action='store_true',
-        help="Do not write any errors, warnings or info to stderr",
-    )
-    parser.add_argument(
-        "--paperkey-path", default="paperkey",
-        help="The path to the paperkey program",
-    )
-    parser.add_argument(
-        "-p", "--otp", action='store_true',
-        help="Use PBKDF2-based one-time pad",
-    )
-    parser.add_argument(
-        "-i", metavar="ITERATIONS", type=int, default=1,
-        help="Use that many iterations in PBKDF2",
-    )
-    parser.add_argument(
-        "-s", metavar="SALT", dest='nonce', type=bytes, default="",
-        help="Salt suffix to be appended to the each fingerprint",
+        help="do not write any errors, warnings or info to stderr",
     )
     coding_group = parser.add_mutually_exclusive_group()
     coding_group.add_argument(
         "-a", "--ascii", action='store_true',
-        help="Use base64 coding instead of raw (binary)",
+        help="use base64 coding instead of raw (binary)",
     )
     coding_group.add_argument(
         "-x", "--hex", action='store_true',
-        help="Use base16 coding instead of raw (binary)",
+        help="use base16 coding instead of raw (binary)",
+    )
+
+    parser.add_argument(
+        "-p", "--otp", action='store_true',
+        help="use PBKDF2-based one-time pad",
     )
     parser.add_argument(
-        "--secret-key",
-        help="Read the key to minify from this file (not stdin)",
+        "-i", metavar="N_ITER", type=int, default=1,
+        help="use that many iterations in PBKDF2",
     )
     parser.add_argument(
-        "-r", dest='min_key_file', type=argparse.FileType('rb'),
-        help="Recover the minified key from this file (not stdin)",
+        "-s", metavar="SALT_SUFFIX", dest='nonce', type=bytes, default="",
+        help="append OTP salt suffix to fingerprints (use as nonce)",
     )
+
+    min_unmin_group = parser.add_mutually_exclusive_group()
+    min_unmin_group.add_argument(
+        "-r", dest='min_key_file', nargs='?', type=argparse.FileType('rb'),
+        const='-',              # make stdin the implicit argument
+        help="recover the minified key from the path or stdin",
+    )
+    min_unmin_group.add_argument(
+        "--secret-key", metavar="FILE",
+        help="read the key to minify from this file (not stdin)",
+    )
+    parser.add_argument(
+        "--paperkey-path", metavar="PATH", default="paperkey",
+        help="the path to the paperkey program",
+    )
+    parser.add_argument(
+        "--gpg-path", metavar="PATH", default="gpg",
+        help="the path to the gpg program",
+    )
+
     recov_args = parser.add_argument_group("recovery options")
     recov_args.add_argument(
-        "--pubring",
-        help="Public keyring used to unminify the key",
+        "--pubring", metavar="PATH",
+        help="public keyring used to unminify the key",
     )
     recov_args.add_argument(
-        "--fingerprint", metavar='FINGERPRINT', dest='fingerprints',
+        "--fingerprint", metavar="HEX", dest='fingerprints',
         action='append',
-        help="Specify a (sub)key fingerprint (bypasses gpg)",
+        help="(sub)key fingerprint (bypasses gpg, can be repeated)",
     )
     recov_args.add_argument(
-        "--gpg-path", default="gpg",
-        help="The path to the gpg program",
-    )
-    recov_args.add_argument(
-        "--length-diff", type=int,
+        "--length-diff", metavar="DIFF", type=int,
         help="|subkey| - |key| (use only if warned)",
     )
-    common_prefix_group = recov_args.add_mutually_exclusive_group()
-    common_prefix_group.add_argument(
-        "--prefix-length", type=int, default=_SECRET_COMMON_PREFIX_OCTET_CNT,
-        help="Secret common prefix length (use only if warned)",
+    recov_args.add_argument(
+        "--prefix-length", metavar="N",
+        type=int, default=_SECRET_COMMON_PREFIX_OCTET_CNT,
+        help="secret common prefix length (use only if warned)",
     )
-    s2k_group = parser.add_argument_group("GPG's --s2k-* options")
-    s2k_group.add_argument(
-        "--s2k-cipher-algo", default=S2K_DEFAULTS.cipher_algo,
-        choices=S2K_CIPHER_ALGOS,
-        help="Cipher algorithm that was used to encrypt the key",
+    recov_args.add_argument(
+        "--plaintext", action='store_true',
+        help="interpret the key to unminify as plaintext",
     )
-    s2k_group.add_argument(
-        "--s2k-digest-algo", default=S2K_DEFAULTS.digest_algo,
-        choices=S2K_DIGEST_ALGOS,
-        help="Digest algorithm that was used to encrypt the key",
+    recov_args.add_argument(
+        "--s2k-cipher-algo", choices=S2K_CIPHER_ALGOS,
+        default=S2K_CIPHER_OCTETS[S2K_DEFAULTS.cipher_algo],
+        help="cipher algorithm that was used to encrypt the key",
     )
-    s2k_group.add_argument(
-        "--s2k-count", default=S2K_DEFAULTS.count,
-        type=int,
-        help="Number of times the key passphrase was mangled",
+    recov_args.add_argument(
+        "--s2k-digest-algo", choices=S2K_DIGEST_ALGOS,
+        default=S2K_DIGEST_OCTETS[S2K_DEFAULTS.digest_algo],
+        help="digest algorithm that was used to encrypt the key",
+    )
+    recov_args.add_argument(
+        "--s2k-count", metavar="N_ITER",
+        type=int, default=S2KCountCodec().decode(S2K_DEFAULTS.count),
+        help="number of times the key passphrase was mangled",
     )
 
     args = parser.parse_args(args)
@@ -395,14 +577,21 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
 
     verbosity = args.verbosity if not args.quiet else -1
 
-    if args.key or (args.fingerprints and args.pubring):
+    def export_fingerprints():
+        pgp_out = _quiet_check_output([
+            args.gpg_path, "--fingerprint", "--fingerprint", args.key,
+        ], "gpg failed to match the key")
+        if sum(map(lambda s: s.startswith("uid"), pgp_out.split("\n"))) != 1:
+            raise parser.error("no unique match for the key: " + args.key)
+        return _parse_fingerprints(pgp_out)
+
+    if args.min_key_file:
+        if not (args.key or (args.fingerprints and args.pubring)):
+            parser.error("not specified the key to unminify")
+
         fps = args.fingerprints
         if fps is None:
-            fps = _parse_fingerprints(
-                _quiet_check_output([
-                    args.gpg_path, "--fingerprint", "--fingerprint", args.key,
-                ], "failed to retrieve fingerprints from gpg")
-            )
+            fps = export_fingerprints()
             if verbosity > 0:
                 for fp in fps:
                     _info("Parsed fingerprint:", fp)
@@ -415,10 +604,10 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
         if verbosity > 1:
             _info("Secret length differences:", ' '.join(map(str, len_diffs)))
 
-        s2k = create_s2k(
-            cipher_algo=args.s2k_cipher_algo,
-            digest_algo=args.s2k_digest_algo,
-            count=args.s2k_count,
+        s2k = None if args.plaintext else S2K(
+            cipher_algo=S2K_CIPHER_ALGOS[args.s2k_cipher_algo],
+            digest_algo=S2K_DIGEST_ALGOS[args.s2k_digest_algo],
+            count=S2KCountCodec().encode(args.s2k_count),
         )
 
         octets = get_arg('min_key_file', sys.stdin).read()
@@ -445,14 +634,18 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
             ),
         ))
     else:
-        if args.min_key_file:
-            parser.error("not specified the key to unminify")
+        def export_secret_key():
+            export_fingerprints() # ensure unique
+            return _quiet_check_output([
+                args.gpg_path, "--export-secret-key", args.key
+            ], "failed to export the secret key: " + args.key)
 
-        octets, fps = minify(_quiet_check_output(
+        octets, fps, s2k = minify(_quiet_check_output(
             [args.paperkey_path] + (
                 ["--secret-key", args.secret_key] if args.secret_key else []
             ) + ["--output-type", "raw"],
             "failed to extract secret part of the key using paperkey",
+            input=export_secret_key() if args.key else None,
         ))
 
         if args.otp:
@@ -467,7 +660,7 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
 
 if __name__ == '__main__':
     def _error(exit_code, *objs):
-        _info("%s: " % __file__, *objs)
+        _info("%s:" % __file__, *objs)
         sys.exit(exit_code)
 
     try:
@@ -482,7 +675,9 @@ if __name__ == '__main__':
         _info(
 """Note: storing multiple subkeys is redundant and thus discouraged.
 Back up only the master key (with an encryption subkey), then
-encrypt other subkeys using the masterkey.
+encrypt other subkeys using the master key.
 """
         )
-        sys.exit(4)
+        _error(4, e)
+    except Exception as e:
+        _error(5, e)

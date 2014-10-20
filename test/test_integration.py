@@ -22,11 +22,11 @@ from __future__ import absolute_import
 import data.fingerprints
 import data.minified
 import data.paperkey
+import pkmin
 
 import binascii
 import itertools
 import os
-import pkmin
 import struct
 import sys
 import unittest
@@ -106,46 +106,60 @@ class MainTest(unittest.TestCase):
     def assertMinified(self, out, var):
         self.assertEqual(hexlify(getattr(data.minified, var)), hexlify(out))
 
-    def test_minify_no_otp(self):
-        out, err = self.call_main({
-            '--secret-key': _sec_key_path('rsa2240-s2k-count'),
-        })
-        self.assertMinified(out, 'RSA_2240_CAST5_SHA1_45678')
-        self.assertEqual("", err)
-
     def assertOptionReminded(self, err, option_str):
         self.assertRegexpMatches(err, 'REMEMBER to pass "%s"' % option_str)
 
-    def test_minify_no_otp_length_diff_prefix_length(self):
-        out, err = self.call_main({
-            '--secret-key': _sec_key_path('dsa1024-nopass'),
+    def test_minify_s2k_outside_common_prefix_not_reminded(self):
+        _, err = self.call_main({
+            '--secret-key': _sec_key_path(
+                'RSA_4096_CAST5_SHA512_65011712_NOSIGN'
+            ),
         })
-        self.assertMinified(out, 'DSA_1024_NOPASS')
+        self.assertOptionReminded(err, "--prefix-length 2")
+        self.assertOptionReminded(err, "--s2k-digest-algo SHA512")
+
+    def test_minify_no_otp_s2k_count_only(self):
+        key = 'RSA_2240_CAST5_SHA1_45678'
+        out, err = self.call_main({
+            '--secret-key': _sec_key_path(key),
+        })
+        self.assertMinified(out, key)
+        self.assertOptionReminded(err, "--s2k-count 47104")
+        self.assertNotRegexpMatches(err, "--s2k-cipher-algo")
+        self.assertNotRegexpMatches(err, "--s2k-digest-algo")
+        self.assertNotRegexpMatches(err, "--length-diff")
+        self.assertNotRegexpMatches(err, "--prefix-length")
+        self.assertNotRegexpMatches(err, "--plaintext")
+
+    def test_minify_no_otp_length_diff_prefix_length_plaintext(self):
+        key = 'DSA_1024_PLAINTEXT'
+        out, err = self.call_main({
+            '--secret-key': _sec_key_path(key),
+        })
+        self.assertMinified(out, key)
         self.assertOptionReminded(err, "--length-diff 12")
         self.assertOptionReminded(err, "--prefix-length 2")
+        self.assertOptionReminded(err, "--plaintext")
 
-    def test_minify_allzeroes_key_same_as_no_otp(self):
-        arg_dict = {'--secret-key': _sec_key_path('dsa1024-nopass')}
+    # def test_minify_no_otp_s2k_cipher_algo_only(self):
+    #     raise NotImplementedError
+
+    def test_minify_allzeroes_otp_same_as_no_otp(self):
+        arg_dict = {'--secret-key': _sec_key_path('DSA_1024_PLAINTEXT')}
         self.assertEqual(
             hexlify(self.call_main(arg_dict, [], None)[0]),
             hexlify(self.call_main(arg_dict, [], _allzeroes_key_factory)[0]),
         )
 
-    def test_minify_allzeroes_key_same_as_no_otp(self):
-        arg_dict = {'--secret-key': _sec_key_path('dsa1024-nopass')}
-        self.assertEqual(
-            hexlify(self.call_main(arg_dict, [], None)[0]),
-            hexlify(self.call_main(arg_dict, [], _allzeroes_key_factory)[0]),
-        )
-
-    def test_minify_iota_otp(self):
-        octets = _xor_iota(
-            self.call_main(
-                {'--secret-key': _sec_key_path('dsa1024-nopass')},
+    def test_minify_iota_otp_s2k_digest_algo_only(self):
+        key = 'DSA_1024_CAST5_SHA512_65536'
+        octets, err = self.call_main(
+                {'--secret-key': _sec_key_path(key)},
                 [], _iota_key_factory,
-            )[0]
-        )
-        self.assertMinified(octets, 'DSA_1024_NOPASS')
+            )
+        self.assertMinified(_xor_iota(octets), key)
+        self.assertOptionReminded(err, "--s2k-digest-algo SHA512")
+        self.assertNotRegexpMatches(err, "--s2k-cipher-algo")
 
     def _create_salt_checking_allzeroes_key_factory(self, exp_salt):
         def key_factory(key_len, salt, iter_cnt):
@@ -154,57 +168,68 @@ class MainTest(unittest.TestCase):
         return key_factory
 
     def test_minify_otp_salt_no_nonce(self):
+        key = 'DSA_1024_PLAINTEXT'
         self.call_main(
-            {'--secret-key': _sec_key_path('dsa1024-nopass')},
+            {'--secret-key': _sec_key_path(key)},
             [],
             self._create_salt_checking_allzeroes_key_factory(
-                b"".join(getattr(data.fingerprints, 'DSA_1024_NOPASS'))
+                b"".join(getattr(data.fingerprints, key))
             ),
         )
 
     def test_minify_otp_salt_long_nonce(self):
+        key = 'DSA_1024_PLAINTEXT'
         nonce = b"0123456789" * 100
         self.call_main(
-            {'--secret-key': _sec_key_path('dsa1024-nopass'), '-s': nonce},
+            {'--secret-key': _sec_key_path(key), '-s': nonce},
             [],
             self._create_salt_checking_allzeroes_key_factory(
-                b"".join(getattr(data.fingerprints, 'DSA_1024_NOPASS')) + nonce
+                b"".join(getattr(data.fingerprints, key)) + nonce
             ),
         )
 
     def assertUnminified(self, out, key):
         with open(_sec_key_path(key)) as unmin_key_file:
-            self.assertEqual(hexlify(unmin_key_file.read()), hexlify(out))
+            self.assertSequenceEqual(
+                hexlify(unmin_key_file.read()),
+                hexlify(out),
+            )
 
     def test_unminify_allzeroes_otp(self):
-        key = 'rsa2240-s2k-count'
+        key = 'RSA_2240_CAST5_SHA1_45678'
         arg_dict = {
             '-r': _min_key_path(key),
             '--pubring': _pub_key_path(key),
+            '--s2k-count': "45678",
         }
-        args = _create_fingerprint_args('RSA_2240_CAST5_SHA1_45678')
+        args = _create_fingerprint_args(key)
         out, _ = self.call_main(arg_dict, args, _allzeroes_key_factory)
         self.assertUnminified(out, key)
 
     def test_unminify_iota_otp(self):
-        key = 'rsa2240-s2k-count'
+        key = 'RSA_2240_CAST5_SHA1_45678'
         with open(_min_key_path(key)) as key_file:
             xorified_octets = _xor_iota(key_file.read())
         with _string_stream('stdin', xorified_octets):
             out, err = self.call_main(
-                {'--pubring': _pub_key_path(key)},
-                _create_fingerprint_args('RSA_2240_CAST5_SHA1_45678'),
+                {
+                    '-r': '-',
+                    '--pubring': _pub_key_path(key),
+                    '--s2k-count': "45678",
+                },
+                _create_fingerprint_args(key),
                 _iota_key_factory,
             )
             self.assertUnminified(out, key)
 
-    def test_unminify_no_otp_length_diff(self):
-        key = 'dsa1024-nopass'
+    def test_unminify_no_otp_length_diff_prefix_length_plaintext(self):
+        key = 'DSA_1024_PLAINTEXT'
         arg_dict = {
             '-r': _min_key_path(key),
             '--pubring': _pub_key_path(key),
+            '--plaintext': None,
         }
-        args = _create_fingerprint_args('DSA_1024_NOPASS')
+        args = _create_fingerprint_args(key)
         with self.assertRaisesRegexp(ValueError, "length diffs inconsistent"):
             self.call_main(arg_dict, args)
 
@@ -214,9 +239,48 @@ class MainTest(unittest.TestCase):
         ])
         self.assertUnminified(out, key)
 
+    def test_no_otp_reversible_all_default(self):
+        key = 'RSA_2048_CAST5_SHA1_65536'
+        args = _create_fingerprint_args(key) + [
+            '-r',
+            '--pubring', _pub_key_path(key)
+        ]
+
+        min_out, err = self.call_main({'--secret-key': _sec_key_path(key)})
+        self.assertEqual("", err) # verify no reminders printed
+
+        with _string_stream('stdin', min_out):
+            out, err = self.call_main({}, args)
+            self.assertEqual("", err)
+            self.assertUnminified(out, key)
+
+    def test_no_otp_reversible_s2k_all_custom(self):
+        key = 'RSA_4096_AES256_SHA512_65011712'
+        args = _create_fingerprint_args(key) + [
+            '-r',
+            '--pubring', _pub_key_path(key),
+            '--s2k-cipher-algo', "AES256",
+            '--s2k-digest-algo', "SHA512",
+            '--s2k-count', "65011712",
+        ]
+
+        min_out, err = self.call_main({'--secret-key': _sec_key_path(key)})
+
+        self.assertOptionReminded(err, "--s2k-count 65011712")
+        self.assertOptionReminded(err, "--s2k-cipher-algo AES256")
+        self.assertOptionReminded(err, "--s2k-digest-algo SHA512")
+        self.assertNotRegexpMatches(err, "--length-diff")
+        self.assertNotRegexpMatches(err, "--prefix-length")
+
+        with _string_stream('stdin', min_out):
+            out, err = self.call_main({}, args)
+            self.assertEqual("", err)
+            self.assertUnminified(out, key)
+
     def test_pbkdf2_otp_reversible_only_if_correct_params(self):
-        key = 'rsa2240-s2k-count'
-        args = _create_fingerprint_args('RSA_2240_CAST5_SHA1_45678') + [
+        key = 'RSA_2240_CAST5_SHA1_45678'
+        args = _create_fingerprint_args(key) + [
+            '-r',
             '--pubring', _pub_key_path(key),
         ]
         def create_pbkdf2_key_factory(passphrase="S0me p@ss"):
@@ -225,10 +289,11 @@ class MainTest(unittest.TestCase):
         min_out, err = self.call_main({
             '--secret-key': _sec_key_path(key),
         }, [], create_pbkdf2_key_factory())
-        self.assertEqual("", err)
+        self.assertOptionReminded(err, "--s2k-count 47104")
 
         with _string_stream('stdin', min_out):
             out, err = self.call_main({
+                '--s2k-count': "45678",
             }, args, create_pbkdf2_key_factory())
             self.assertEqual("", err)
             self.assertUnminified(out, key)
@@ -236,6 +301,7 @@ class MainTest(unittest.TestCase):
         with _string_stream('stdin', min_out):
             out, err = self.call_main({
                 '-i': "42",
+                '--s2k-count': "45678",
             }, args, create_pbkdf2_key_factory())
             self.assertEqual("", err) # validate no errors for wrong -i
             self.assertRaises(AssertionError, self.assertUnminified, out, key)
@@ -243,6 +309,7 @@ class MainTest(unittest.TestCase):
         with _string_stream('stdin', min_out):
             out, err = self.call_main({
                 '-s': "wrong salt",
+                '--s2k-count': "45678",
             }, args, create_pbkdf2_key_factory())
             self.assertEqual("", err) # validate no errors for wrong -s
             self.assertRaises(AssertionError, self.assertUnminified, out, key)
@@ -253,5 +320,10 @@ class MainTest(unittest.TestCase):
             self.assertEqual("", err) # validate no errors for wrong passphrase
             self.assertRaises(AssertionError, self.assertUnminified, out, key)
 
+    # maxDiff = None
+
     def setUp(self):
         setattr(pkmin, 'verbosity', 0)
+
+if __name__ == '__main__':
+    unittest.main()

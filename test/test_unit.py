@@ -22,9 +22,9 @@ from __future__ import absolute_import
 import data.fingerprints
 import data.minified
 import data.paperkey
+import pkmin
 
 import binascii
-import pkmin
 import struct
 import unittest
 
@@ -32,10 +32,6 @@ from binascii import hexlify, unhexlify
 
 class ParseFingerprintTest(unittest.TestCase):
     def assertParses(self, gpg_out, *fingerprints):
-        # actual = map(
-        #     lambda s: binascii.hexlify(s).upper(),
-        #     pkmin._parse_fingerprints(gpg_out),
-        # )
         actual = pkmin._parse_fingerprints(gpg_out)
         expected = list(fingerprints)
         self.assertEqual(expected, actual)
@@ -104,64 +100,130 @@ class XorifyTest(unittest.TestCase):
         otp = bytes(bytearray(reversed(octets)))
         self.assertEqual(octets, pkmin._xorify(pkmin._xorify(octets, otp), otp))
 
+class S2KCountCodecTest(unittest.TestCase):
+    codec = pkmin.S2KCountCodec()
+    def test_decode(self):
+        for octet, exp in {
+                b"\x00": 1024,
+                b"\x0a": 1664,
+                b"\x33": 9728,
+                b"\x5c": 57344,
+                b"\xb2": 2359296,
+                b"\xfe": 62914560,
+                b"\xff": 65011712,
+        }.iteritems():
+            self.assertEqual(exp, self.codec.decode(octet))
+
+    def test_encode(self):
+        for octet, exp in {
+                0: b"\x00", 1023: b"\x00", 1024: b"\x00",
+                1664: b"\x0a",
+                1665: b"\x0b",
+                9728: b"\x33",
+                57344: b"\x5c",
+                2359296: b"\xb2",
+                64000000: b"\xFF",
+                65011712: b"\xFF",
+        }.iteritems():
+            self.assertEqual(hexlify(exp), hexlify(self.codec.encode(octet)))
+
+    def test_invertible(self):
+        for octet in bytes(bytearray(i for i in range(0x100))):
+            count = self.codec.decode(octet)
+            self.assertTrue(1024 <= count <= 65011712)
+            self.assertEqual(octet, self.codec.encode(count))
+
 class MinifyTest(unittest.TestCase):
     def assertMinifies(self, var):
-        act_key, act_fps = pkmin.minify(getattr(data.paperkey, var))
+        act_key, act_fps, s2k = pkmin.minify(getattr(data.paperkey, var))
         act_key = hexlify(act_key)
         self.assertEqual(
             (hexlify(getattr(data.minified, var)),
              getattr(data.fingerprints, var)),
             (act_key, act_fps)
         )
+        return s2k
 
-    def test_DSA_1024_nopass_diff_subkey_len(self):
-        self.assertMinifies('DSA_1024_NOPASS')
+    def test_rsa_2048_default_s2k(self):
+        s2k = self.assertMinifies('RSA_2048_CAST5_SHA1_65536')
+        self.assertEqual(pkmin.S2K_DEFAULTS, s2k)
 
-    def test_DSA_1024_SHA512_diff_subkey_len(self):
-        self.assertMinifies('DSA_1024_CAST5_SHA512')
+    def test_dsa_1024_plaintext_diff_subkey_len(self):
+        s2k = self.assertMinifies('DSA_1024_PLAINTEXT')
+        self.assertIsNone(s2k)
 
-    def test_RSA_2240_custom_s2k_count(self):
-        self.assertMinifies('RSA_2240_CAST5_SHA1_45678')
+    def test_dsa_1024_sha512_diff_subkey_len(self):
+        s2k = self.assertMinifies('DSA_1024_CAST5_SHA512_65536')
+        self.assertNotEqual(None, s2k)
+        self.assertEqual(pkmin.S2K_CIPHER_ALGOS['CAST5'], s2k.cipher_algo)
+        self.assertEqual(pkmin.S2K_DIGEST_ALGOS['SHA512'], s2k.digest_algo)
+        self.assertEqual(pkmin.S2KCountCodec().encode(65536), s2k.count)
 
-    def test_RSA_4096_aes256_sha512_max_s2k_count_nosign(self):
-        self.assertMinifies('RSA_4096_AES256_SHA512_MAX_S2K_COUNT_NOSIGN')
+    def test_rsa_2240_custom_s2k_count(self):
+        s2k = self.assertMinifies('RSA_2240_CAST5_SHA1_45678')
+        self.assertEqual(pkmin.S2KCountCodec().encode(45678), s2k.count)
+        self.assertEqual(pkmin.S2K_DIGEST_ALGOS['SHA1'], s2k.digest_algo)
+
+    def test_rsa_4096_sha512_max_s2k_count_nosign(self):
+        self.assertMinifies('RSA_4096_CAST5_SHA512_65011712_NOSIGN')
 
     @classmethod
     def setUpClass(cls):
         setattr(pkmin, 'verbosity', -1)
+        cls.maxDiff = None
 
     # def setUp(self):
     #     setattr(pkmin, 'verbosity', 2)
-    #     pkmin._info("===", self.id().split('.')[-1], "===")
+    #     pkmin._info("\n===", '.'.join(self.id().split('.')[-2:]), "===")
 
 class UnminifyTest(unittest.TestCase):
     def assertUnminifies(self, var, len_diffs, prefix_len, **s2k):
         act_key = pkmin.unminify(
             getattr(data.minified, var),
             getattr(data.fingerprints, var),
-            pkmin.create_s2k(**s2k),
+            None if s2k.get('plaintext') else
+            pkmin.S2K_DEFAULTS._replace(**s2k),
             len_diffs,
             prefix_len,
         )
         # strip off the ignored CRC-24 checksum and hexlify (for better diff)
-        act_key = hexlify(act_key[:-pkmin._CRC_OCTET_CNT_])
-        exp_key = hexlify(getattr(data.paperkey, var)[:-pkmin._CRC_OCTET_CNT_])
+        act_key = hexlify(act_key[:-pkmin._CRC_OCTET_CNT])
+        exp_key = hexlify(getattr(data.paperkey, var)[:-pkmin._CRC_OCTET_CNT])
         self.assertSequenceEqual(exp_key, act_key)
 
-    def test_DSA_1024_nopass_diff_subkey_len(self):
-        self.assertUnminifies('DSA_1024_NOPASS', [0, 12], 2)
-
-    def test_DSA_1024_sha512_diff_subkey_len(self):
-        self.assertUnminifies('DSA_1024_CAST5_SHA512', [0, 11], 13)
-
-    def test_RSA_2240_custom_s2k_count(self):
-        self.assertUnminifies('RSA_2240_CAST5_SHA1_45678', [0, 0], 13)
-
-    def test_RSA_4096_aes256_sha512_max_s2k_count_nosign(self):
+    def test_rsa_2240_default_s2k(self):
         self.assertUnminifies(
-            'RSA_4096_AES256_SHA512_MAX_S2K_COUNT_NOSIGN',
-            [0, 1321],
+            'RSA_2048_CAST5_SHA1_65536',
+            [0, 0],
+            13,
+        )
+
+    def test_dsa_1024_plaintext_diff_subkey_len(self):
+        self.assertUnminifies('DSA_1024_PLAINTEXT', [0, 12], 2, plaintext=True)
+
+    def test_dsa_1024_sha512_diff_subkey_len(self):
+        self.assertUnminifies(
+            'DSA_1024_CAST5_SHA512_65536',
+            [0, 11],
+            13,
+            digest_algo=pkmin.S2K_DIGEST_ALGOS['SHA512'],
+        )
+
+    def test_rsa_2240_custom_s2k_count(self):
+        self.assertUnminifies(
+            'RSA_2240_CAST5_SHA1_45678',
+            [0, 0],
+            13,
+            count=pkmin.S2KCountCodec().encode(45678),
+        )
+
+    def test_rsa_4096_sha512_max_s2k_count_nosign(self):
+        self.assertUnminifies(
+            'RSA_4096_CAST5_SHA512_65011712_NOSIGN',
+            [0, 1321 - 3],
             2,
+            digest_algo=pkmin.S2K_DIGEST_ALGOS['SHA512'],
+            count=pkmin.S2KCountCodec().encode(65011712),
         )
 
     @classmethod
@@ -171,4 +233,7 @@ class UnminifyTest(unittest.TestCase):
 
     # def setUp(self):
     #     setattr(pkmin, 'verbosity', 2)
-    #     pkmin._info("===", self.id().split('.')[-1], "===")
+    #     pkmin._info("\n===", '.'.join(self.id().split('.')[-2:]), "===")
+
+if __name__ == '__main__':
+    unittest.main()
