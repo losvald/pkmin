@@ -90,6 +90,7 @@ class MainTest(unittest.TestCase):
         arg_dict2 = { # set defaults for arg_dict (without external mods)
             '--paperkey-path': self.paperkey_path,
             '--gpg-path': self.gpg_path,
+            '-i': "1",          # make the test cases run fast
         }
         arg_dict2.update(arg_dict)
         arg_dict = arg_dict2
@@ -141,8 +142,14 @@ class MainTest(unittest.TestCase):
         self.assertOptionReminded(err, "--prefix-length 2")
         self.assertOptionReminded(err, "--plaintext")
 
-    # def test_minify_no_otp_s2k_cipher_algo_only(self):
-    #     raise NotImplementedError
+    def test_minify_no_otp_length_diff_s2k_outside_scp(self):
+        key = 'RSA_4096_CAST5_SHA512_65011712_NOSIGN'
+        out, err = self.call_main({
+            '--secret-key': _sec_key_path(key),
+        })
+        self.assertMinified(out, key)
+        self.assertOptionReminded(err, "--length-diff 1318")
+        self.assertOptionReminded(err, "--prefix-length 2")
 
     def test_minify_allzeroes_otp_same_as_no_otp(self):
         arg_dict = {'--secret-key': _sec_key_path('DSA_1024_PLAINTEXT')}

@@ -201,15 +201,6 @@ def minify(octets):
     if not secrets:
         raise ValueError("Invalid secret key data.")
 
-    secret_lens = map(len, secrets)
-    if len(set(secret_lens)) != 1:
-        len_diffs = [sub_len - secret_lens[0] for sub_len in secret_lens[1:]]
-        _warn(
-            "(Sub)key lengths not unique; |subkey| - |key| = %s" % len_diffs +
-            _create_recovery_reminder("--length-diff", len_diffs)
-        )
-    del secret_lens
-
     scp = bytes(commonprefix(secrets))
     if verbosity > 0:
         _info("Secret common prefix:", _uppercase_hexlify(scp))
@@ -283,13 +274,25 @@ def minify(octets):
     # __ __               <- secret common prefix of length <= 2
     # F? ?? 6? ?? ??      <- s2k mode octet (#3) is 0x64-0x6E (experimental)
     # F? ?? 0? ?? ?? ...  <- s2k mode octet (#3) is 0x00, 0x01 or 0x03
-    secrets[-1], scp_strip_cnt, s2k = strip_s2k_part(secrets[-1])
-    secrets[-1] = secrets[-1][len(scp) - scp_strip_cnt :]
+    secrets[-1], last_scp_strip_cnt, s2k = strip_s2k_part(secrets[-1])
+    secrets[-1] = secrets[-1][len(scp) - last_scp_strip_cnt :]
     secrets[:-1] = map(lambda s: s[len(scp):], secrets[:-1])
-    scp = strip_s2k_part(scp)[0] # strip S2K part from the common prefix
+    scp, min_scp_strip_cnt, _ = strip_s2k_part(scp) # strip S2K part from SCP
+
+    secret_lens = map(len, secrets)
+    if len(set(secret_lens)) != 1:
+        len_diffs = [
+            sub_len - secret_lens[0] - (last_scp_strip_cnt - min_scp_strip_cnt)
+            for sub_len in secret_lens[1:]
+        ]
+        _warn(
+            "(Sub)key lengths not unique; |subkey| - |key| = %s" % len_diffs +
+            _create_recovery_reminder("--length-diff", len_diffs)
+        )
+    del secret_lens
 
     # Remind for non-default S2K options
-    if not scp_strip_cnt:
+    if not last_scp_strip_cnt:
         _warn("key not encrypted" + _create_recovery_reminder("--plaintext"))
     else:
         crr = _create_recovery_reminder # reduce verbosity by aliasing
@@ -504,7 +507,7 @@ def main(args, otp_key_factory=_create_pbkdf2_key_factory(_read_passphrase)):
         help="use PBKDF2-based one-time pad",
     )
     parser.add_argument(
-        "-i", metavar="N_ITER", type=int, default=1,
+        "-i", metavar="N_ITER", type=int, default=65536,
         help="use that many iterations in PBKDF2",
     )
     parser.add_argument(
